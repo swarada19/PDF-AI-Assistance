@@ -1,127 +1,296 @@
-# Advanced PDF AI Assistant with Corrected Imports
+from flask import Flask, request, jsonify, render_template, Response
+
+app = Flask(__name__)
+
 import os
-import tempfile
-import streamlit as st
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_community.llms import Ollama
-from langchain_community.document_loaders import PyMuPDFLoader
-from langchain.chains import RetrievalQA
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.chains import create_retrieval_chain
-from langchain_core.prompts import ChatPromptTemplate
-from langchain.chains.summarize import load_summarize_chain
 
-st.set_page_config(page_title="📄 PDF AI Assistant", layout="wide")
-st.title("📄 Advanced PDF AI Assistant")
+os.environ["FLASK_RUN_EXTRA_FILES"] = ""
 
-@st.cache_data(show_spinner=False)
-def process_documents(uploaded_files):
-    all_chunks = []
-    all_docs = []
-    for file in uploaded_files:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(file.read())
-            tmp_path = tmp.name
+UPLOAD_FOLDER = "uploads"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-        loader = PyMuPDFLoader(tmp_path)
-        documents = loader.load()
-        all_docs.extend(documents)
-        
-        # Clean up temporary file
-        os.unlink(tmp_path)
+from haystack.document_stores.in_memory import InMemoryDocumentStore
 
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    all_chunks = text_splitter.split_documents(all_docs)
-    return all_docs, all_chunks
+document_store = InMemoryDocumentStore()
 
-@st.cache_data(show_spinner=False)
-def get_summary(_docs):
-    llm_summary = Ollama(model="llama3.2")
-    summary_chain = load_summarize_chain(llm_summary, chain_type="stuff")
-    return summary_chain.run(_docs[:10])  # Limit for performance
+from haystack.document_stores.in_memory import InMemoryDocumentStore
+document_store = InMemoryDocumentStore()
 
-@st.cache_resource
-def create_vectorstore(_docs):
-    embeddings = OllamaEmbeddings(model="nomic-embed-text")
-    return FAISS.from_documents(_docs, embeddings)
+from haystack.components.embedders import SentenceTransformersTextEmbedder
 
-def create_qa_chain(vectorstore):
-    llm_qa = Ollama(model="llama3.2")
-    
-    # Create prompt template
-    prompt = ChatPromptTemplate.from_template("""
-    You are a helpful assistant. Use the following context to answer the question at the end.
-    If you don't know the answer, just say you don't know, don't try to make up an answer.
+text_embedder = SentenceTransformersTextEmbedder(
+    model="sentence-transformers/all-MiniLM-L6-v2"
+)
+text_embedder.warm_up()
 
-    Context:
-    {context}
 
-    Question:
-    {input}
 
-    Helpful Answer:
-    """)
-    
-    # Create document chain
-    document_chain = create_stuff_documents_chain(llm_qa, prompt)
-    
-    # Create retrieval chain
-    retrieval_chain = create_retrieval_chain(vectorstore.as_retriever(), document_chain)
-    
-    return retrieval_chain
+# pre-processing pipeline
+from haystack.components.writers import DocumentWriter
+from haystack.components.converters import MarkdownToDocument, PyPDFToDocument, TextFileToDocument
+from haystack.components.preprocessors import DocumentSplitter, DocumentCleaner
+from haystack.components.routers import FileTypeRouter
+from haystack.components.joiners import DocumentJoiner
+from haystack.components.embedders import SentenceTransformersDocumentEmbedder
+from haystack.components.converters.csv import CSVToDocument
 
-uploaded_files = st.file_uploader("Upload one or more PDFs", type="pdf", accept_multiple_files=True)
+file_type_router = FileTypeRouter(mime_types=["text/plain", "application/pdf", "text/markdown", "text/csv"])
+text_file_converter = TextFileToDocument()
+markdown_converter = MarkdownToDocument()
+pdf_converter = PyPDFToDocument()
+csv_converter = CSVToDocument()
+document_joiner = DocumentJoiner()
 
-if uploaded_files:
-    with st.spinner("Processing PDFs..."):
-        all_docs, all_chunks = process_documents(uploaded_files)
+document_cleaner = DocumentCleaner()
+document_splitter = DocumentSplitter(split_by="word", split_length=150, split_overlap=50)
+document_embedder = SentenceTransformersDocumentEmbedder(model="sentence-transformers/all-MiniLM-L6-v2")
+document_embedder.warm_up()  # Load the embedding model into memory
+document_writer = DocumentWriter(document_store)
 
-    st.subheader("📝 Document Summary")
-    try:
-        summary = get_summary(all_chunks)
-        st.write(summary)
-    except Exception as e:
-        st.warning(f"Could not generate summary: {str(e)}")
+from haystack import Pipeline
 
-    with st.spinner("Creating vector store..."):
-        vectorstore = create_vectorstore(all_chunks)
+preprocessing_pipeline = Pipeline()
+preprocessing_pipeline.add_component(instance=file_type_router, name="file_type_router")
+preprocessing_pipeline.add_component(instance=text_file_converter, name="text_file_converter")
+preprocessing_pipeline.add_component(instance=markdown_converter, name="markdown_converter")
+preprocessing_pipeline.add_component(instance=pdf_converter, name="pypdf_converter")
+preprocessing_pipeline.add_component(instance=csv_converter, name="csv_converter")
+preprocessing_pipeline.add_component(instance=document_joiner, name="document_joiner")
+preprocessing_pipeline.add_component(instance=document_cleaner, name="document_cleaner")
+preprocessing_pipeline.add_component(instance=document_splitter, name="document_splitter")
+preprocessing_pipeline.add_component(instance=document_embedder, name="document_embedder")
+preprocessing_pipeline.add_component(instance=document_writer, name="document_writer")
 
-    qa_chain = create_qa_chain(vectorstore)
+preprocessing_pipeline.connect("file_type_router.text/plain", "text_file_converter.sources")
+preprocessing_pipeline.connect("file_type_router.application/pdf", "pypdf_converter.sources")
+preprocessing_pipeline.connect("file_type_router.text/markdown", "markdown_converter.sources")
+preprocessing_pipeline.connect("file_type_router.text/csv", "csv_converter.sources")
+preprocessing_pipeline.connect("text_file_converter", "document_joiner")
+preprocessing_pipeline.connect("pypdf_converter", "document_joiner")
+preprocessing_pipeline.connect("markdown_converter", "document_joiner")
+preprocessing_pipeline.connect("csv_converter", "document_joiner")
+preprocessing_pipeline.connect("document_joiner", "document_cleaner")
+preprocessing_pipeline.connect("document_cleaner", "document_splitter")
+preprocessing_pipeline.connect("document_splitter", "document_embedder")
+preprocessing_pipeline.connect("document_embedder", "document_writer")
 
-    st.subheader("💬 Ask Questions")
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
 
-    query = st.text_input("Ask a question about your PDFs:")
 
-    if query:
-        with st.spinner("Generating answer..."):
+from haystack.components.embedders import SentenceTransformersTextEmbedder
+
+text_embedder = SentenceTransformersTextEmbedder(
+    model="sentence-transformers/all-MiniLM-L6-v2"
+)
+text_embedder.warm_up()
+
+# Global variable to store the customizable part of the prompt
+default_prompt_prefix = """ You are an advanced data analyst.
+Given the question and supporting documents below, give a comprehensive answer to the question.
+Respond only to the question asked, response should be concise and relevant to the question.
+Provide the number of the source document when relevant.
+
+When responding to queries:
+1. Reference specific evidence from the provided context to support your analysis
+2. Explain terminology when introducing new concepts
+3. Organize complex findings in a structured format for clarity
+4. If you are uncertain about any aspect, clearly state which parts you are confident about versus where you're making educated assessments
+5. If the answer cannot be determined from the provided context, respond with "I don't have sufficient information in this context to answer that question, please frame your question better."
+"""
+
+default_prompt_suffix = """Handling off-topic questions:
+1. Only answer questions directly related to the information provided in the context
+2. If asked a question unrelated to the logs (e.g., general knowledge questions, personal queries, or questions about unrelated systems), respond with:
+   "I'm designed to analyze only the {data provided in the current context}. Please ask questions related to {this data}. For general information or questions about other topics, please consult a general-purpose assistant."
+3. Do not attempt to answer questions that require knowledge outside the provided data, even if you possess such information
+4. Redirect the conversation back to the data analysis task when appropriate
+
+Based on the provided context (if any), answer the user's specific question in a direct and succinct manner. 
+If there is no context provided, still answer the user's question **directly**. Do **not** create any follow-up questions or continue generating answers after the user’s question is fully addressed.
+Ensure that you respond **only** to the user's **specific question** and avoid creating additional questions or answers on your own. Maintain a concise and respectful tone.
+
+Context: {context}
+
+Question: {question}
+
+Answer:"""
+
+
+# file upload route
+import os
+import shutil
+
+# Define supported file types
+SUPPORTED_EXTENSIONS = {".txt", ".pdf", ".csv", ".md"}
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if request.method == "POST":
+        if "files" not in request.files:
+            return jsonify({"error": "No file uploaded"}), 400
+
+        files = request.files.getlist("files")
+        if not files or all(file.filename == "" for file in files):
+            return jsonify({"error": "No valid files selected"}), 400
+
+        uploaded_files = []
+        file_paths = []
+        errors = {}
+
+        # Temporary folder for initial storage
+        temp_folder = os.path.join(app.config["UPLOAD_FOLDER"], "temp")
+        os.makedirs(temp_folder, exist_ok=True)
+
+        for file in files:
+            ext = os.path.splitext(file.filename)[1].lower()  # Get file extension
+            if ext not in SUPPORTED_EXTENSIONS:
+                errors[file.filename] = "Unsupported file format"
+                continue  # Skip saving unsupported files
+
             try:
-                result = qa_chain.invoke({"input": query})
-                answer = result['answer']
-                # Extract source documents if available
-                sources = []
-                if 'context' in result:
-                    for doc in result['context']:
-                        if hasattr(doc, 'metadata') and 'source' in doc.metadata:
-                            sources.append(doc.metadata['source'])
-                
-                st.session_state.chat_history.append((query, answer, sources))
+                file_path = os.path.join(temp_folder, file.filename)
+                file.save(file_path)
+                file_paths.append(file_path)  # Save path for processing
+                uploaded_files.append(file.filename)
             except Exception as e:
-                st.error(f"Error generating answer: {str(e)}")
+                errors[file.filename] = f"File upload failed: {str(e)}"
 
-    # Display chat history
-    if st.session_state.chat_history:
-        for i, (q, a, sources) in enumerate(reversed(st.session_state.chat_history)):
-            with st.expander(f"Q: {q}"):
-                st.markdown(f"**Answer:** {a}")
-                if sources:
-                    st.markdown("**Sources:**")
-                    for source in sources:
-                        st.write(f"- {source}")
+        # If no valid files were uploaded, return an error
+        if not file_paths:
+            return jsonify({"error": "No valid files uploaded", "failed_files": errors}), 400
 
-        # Download last answer
-        last_answer = st.session_state.chat_history[-1][1]
-        st.download_button("📥 Download Last Answer", last_answer, file_name="answer.txt")
+        try:
+            # Run preprocessing pipeline
+            preprocessing_pipeline.run({"file_type_router": {"sources": file_paths}})
+
+            # If processing succeeds, move files to permanent location
+            for file_path in file_paths:
+                shutil.move(file_path, os.path.join(app.config["UPLOAD_FOLDER"], os.path.basename(file_path)))
+
+            processed_files = uploaded_files  # Successfully processed files
+
+        except Exception as e:
+            # If processing fails, delete temp files
+            for file_path in file_paths:
+                os.remove(file_path)
+
+            return jsonify({"error": "File processing failed", "details": str(e)}), 500
+
+        return jsonify({
+            "message": "Files uploaded and processed successfully",
+            "processed_files": processed_files,
+            "failed_files": errors,
+        })
+
+    return render_template("index.html")
+
+
+
+@app.route("/update_prompt", methods=["POST"])
+def update_prompt():
+    global default_prompt_prefix
+    data = request.json
+    new_prompt = data.get("prompt")
+    if not new_prompt:
+        return jsonify({"error": "No prompt provided"}), 400
+    default_prompt_prefix = new_prompt
+    return jsonify({"message": "Prompt updated successfully"})
+
+
+@app.route("/get_prompt_template", methods=["GET"])
+def get_prompt_template():
+    global default_prompt_prefix
+    return jsonify({"template": default_prompt_prefix})
+
+
+# rag_pipeline
+from haystack.core.component import component
+from haystack.dataclasses import Document
+from typing import List
+
+
+@component
+class CustomPromptBuilder:
+    @component.output_types(prompt=str)
+    def run(self, documents: List[Document], question: str):
+        context = "\n".join([doc.content for doc in documents])
+        prompt = f"{default_prompt_prefix}\n{default_prompt_suffix}".replace(
+            "{context}", context
+        ).replace("{question}", question)
+        return {"prompt": prompt}
+
+
+custom_prompt_builder = CustomPromptBuilder()
+
+from haystack.components.generators import HuggingFaceAPIGenerator
+from haystack.utils import Secret
+
+chat_generator = HuggingFaceAPIGenerator(
+    api_type="serverless_inference_api",
+    api_params={"model": "mistralai/Mistral-7B-Instruct-v0.3"},
+    token=Secret.from_token(HF_API_KEY),
+    generation_kwargs={"max_new_tokens": 1000},
+)
+
+from haystack.components.retrievers.in_memory import InMemoryEmbeddingRetriever
+
+retriever = InMemoryEmbeddingRetriever(document_store)
+
+from haystack import Pipeline
+
+rag_pipeline = Pipeline()
+rag_pipeline.add_component("text_embedder", text_embedder)
+rag_pipeline.add_component("retriever", retriever)
+rag_pipeline.add_component("custom_prompt_builder", custom_prompt_builder)
+rag_pipeline.add_component("llm", chat_generator)
+
+rag_pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
+rag_pipeline.connect("retriever", "custom_prompt_builder")
+rag_pipeline.connect("custom_prompt_builder.prompt", "llm.prompt")
+
+
+@app.route("/ask", methods=["POST"])
+def ask_question():
+    try:
+        data = request.json
+        question = data.get("question", "")
+
+        if not question:
+            return jsonify({"error": "No question provided"}), 400
+
+        # Use the already initialized pipeline instead of recreating it
+        response = rag_pipeline.run(
+            {
+                "text_embedder": {"text": question},
+                "custom_prompt_builder": {"question": question},
+            }
+        )
+
+        return jsonify({"response": response["llm"]["replies"][0]})
+
+    except Exception as e:
+        print("Error:", str(e))  # Logs error in the terminal
+        return jsonify({"error": str(e)}), 500  # Always return valid JSON
+
+
+def generate():
+    import time
+
+    for i in range(10):
+        yield f"data: Processing {i+1}/10\n\n"
+        time.sleep(1)  # Simulate processing time
+    yield "data: done\n\n"
+
+
+@app.route("/progress")
+def progress():
+    return Response(generate(), mimetype="text/event-stream")
+
+
+@app.route("/status", methods=["GET"])
+def status():
+    return jsonify({"message": "API is running"})
+
+
+if __name__ == "__main__":
+    app.run(debug=True, use_reloader=False)
